@@ -1,0 +1,81 @@
+name: Sleutelcontrole v1.0
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  controle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Controle sleutels (toont nooit wachtwoorden)
+        shell: bash
+        env:
+          KS_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KS_PW: ${{ secrets.KEYSTORE_PASSWORD }}
+          K_PW: ${{ secrets.KEY_PASSWORD }}
+          K_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KS_SET: ${{ secrets.KEYSTORE_SET }}
+        run: |
+          set +x
+          export LC_ALL=C
+          ja() { if "$@"; then echo ja; else echo nee; fi; }
+          bevat() { case "$1" in *"$2"*) return 0;; *) return 1;; esac; }
+          randspatie() { [[ "$1" =~ ^[[:space:]] || "$1" =~ [[:space:]]$ ]]; }
+          regeleinde() { [[ "$1" == *$'\n'* || "$1" == *$'\r'* ]]; }
+          echo "=== 1. Welke sleutels zijn ingevuld (aantal tekens) ==="
+          echo "KEYSTORE_BASE64: ${#KS_B64}"
+          echo "KEYSTORE_PASSWORD: ${#KS_PW}"
+          echo "KEY_PASSWORD: ${#K_PW}"
+          echo "KEY_ALIAS: ${#K_ALIAS}"
+          echo "KEYSTORE_SET aanwezig: $([ -n "$KS_SET" ] && echo ja || echo nee)"
+          for naam in KEYSTORE_PASSWORD KEY_PASSWORD; do
+            if [ "$naam" = KEYSTORE_PASSWORD ]; then v="$KS_PW"; else v="$K_PW"; fi
+            echo "=== 2. Tekens in $naam (alleen ja/nee) ==="
+            echo "bevat backslash: $(ja bevat "$v" '\')"
+            echo "bevat dollarteken: $(ja bevat "$v" '$')"
+            echo "bevat backtick: $(ja bevat "$v" '`')"
+            echo "bevat dubbel aanhalingsteken: $(ja bevat "$v" '"')"
+            echo "spatie aan begin of eind: $(ja randspatie "$v")"
+            echo "bevat regeleinde: $(ja regeleinde "$v")"
+          done
+          echo "KEYSTORE_PASSWORD en KEY_PASSWORD gelijk: $(ja [ "$KS_PW" = "$K_PW" ])"
+          echo "=== 3. Lange key (KEYSTORE_BASE64) ==="
+          schoon="$(printf '%s' "$KS_B64" | tr -d ' \t\r\n')"
+          echo "spaties of regeleindes erin: $(( ${#KS_B64} - ${#schoon} ))"
+          echo "tekens zonder spaties: ${#schoon} (verwacht: 3336)"
+          KS="$RUNNER_TEMP/ks.bin"
+          if printf '%s' "$schoon" | base64 -d > "$KS" 2>/dev/null; then echo "omzetten naar bestand: gelukt"; else echo "omzetten naar bestand: MISLUKT (key beschadigd of afgekapt)"; fi
+          echo "bestandsgrootte: $(stat -c%s "$KS") bytes (verwacht: 2500)"
+          echo "vingerafdruk bestand: $(sha256sum "$KS" | cut -d' ' -f1)"
+          echo "=== 4. Wachtwoordtest zoals de echte build (alleen GELUKT/MISLUKT) ==="
+          export KS_PW_ZONDER="${KS_PW//\\/}"
+          export K_PW_ZONDER="${K_PW//\\/}"
+          trim() { local x="${1//$'\r'/}"; x="${x//$'\n'/}"; x="${x#"${x%%[![:space:]]*}"}"; x="${x%"${x##*[![:space:]]}"}"; printf '%s' "$x"; }
+          export KS_PW_SCHOON="$(trim "$KS_PW_ZONDER")"
+          export K_PW_SCHOON="$(trim "$K_PW_ZONDER")"
+          export KS_PW K_PW
+          cd "$RUNNER_TEMP"; echo test > d.txt; rm -f d.jar; zip -q d.jar d.txt
+          goed=""
+          for p in "KS_PW K_PW zoals_opgeslagen" "KS_PW_ZONDER K_PW_ZONDER zonder_backslash" "KS_PW_SCHOON K_PW_SCHOON zonder_backslash_en_spaties"; do
+            set -- $p
+            cp d.jar t.jar
+            if jarsigner -keystore "$KS" -storepass:env "$1" -keypass:env "$2" t.jar "$K_ALIAS" >e.txt 2>&1; then
+              echo "wachtwoord $3: GELUKT"; [ -z "$goed" ] && goed="$1"
+            else
+              echo "wachtwoord $3: MISLUKT ($(grep -m1 -i 'error' e.txt | sed 's/.*: //' | cut -c1-60))"
+            fi
+          done
+          echo "=== 5. Is dit dezelfde sleutel als op je telefoon? ==="
+          if [ -n "$goed" ]; then
+            fp=$(keytool -list -v -keystore "$KS" -storepass:env "$goed" -alias "$K_ALIAS" 2>/dev/null | awk '/SHA256:/{print $2; exit}' | tr -d ':' | tr 'A-F' 'a-f')
+            echo "vingerafdruk sleutel: $fp"
+            if [ "$fp" = "2fb5763dcb9ab40410e6a30bf6edac9ffb5234750ca5db046ee63dbeda65b85c" ]; then echo "zelfde als telefoon (oude sleutel): JA"; else echo "zelfde als telefoon (oude sleutel): NEE"; fi
+          else
+            echo "niet te bepalen: geen enkel wachtwoord past bij dit bestand"
+          fi
+          rm -f "$KS" d.txt d.jar t.jar e.txt
